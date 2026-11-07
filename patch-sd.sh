@@ -38,11 +38,7 @@ p = sys.argv[1]
 s = open(p).read()
 if 'CloverSdDxe' not in s:
     block = '''
-  FILE DRIVER = 7C3A1E52-9B44-4D0E-8E31-5A2C6F1D9B47 {
-    SECTION DXE_DEPEX = Platform/Qualcomm/sdm660/Drivers/CloverSdDxe/CloverSdDxe.depex
-    SECTION PE32 = Platform/Qualcomm/sdm660/Drivers/CloverSdDxe/CloverSdDxe.efi
-    SECTION UI = "CloverSdDxe"
-  }
+  INF Platform/Qualcomm/sdm660/Drivers/CloverSdDxe/CloverSdDxe.inf
 '''
     s = s.rstrip('\n') + '\n' + block
     open(p, 'w').write(s)

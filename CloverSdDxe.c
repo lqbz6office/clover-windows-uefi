@@ -54,6 +54,7 @@
 
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
+#include <Library/CacheMaintenanceLib.h>
 #include <Library/DebugLib.h>
 #include <Library/IoLib.h>
 #include <Library/MemoryAllocationLib.h>
@@ -293,7 +294,7 @@ typedef struct {
 } CLOVER_SD_DEV;
 
 typedef struct {
-  VENDOR_DEVICE_PATH         Vendor;
+  SD_DEVICE_PATH             Sd;
   EFI_DEVICE_PATH_PROTOCOL   End;
 } CLOVER_SD_DEVICE_PATH;
 
@@ -662,9 +663,31 @@ SdTransfer (
 
   Length = (UINT32)BlockCount * SD_BLOCK_SIZE;
 
-  CopyMem (mAdmaBuffer, Buffer, Length);
+  //
+  // Cache coherency.  The ADMA2 engine is a DMA master that reads and writes
+  // physical memory directly, and it has no view of the CPU cache.  The DDR
+  // heap here is write-back (WRITE_BACK_XN in PlatformMemoryMapLib), so the
+  // bounce buffer must be flushed/invalidated around every transfer or the CPU
+  // and the card end up looking at two different copies:
+  //
+  //   read:  invalidate first so the copy-out below sees what the DMA wrote,
+  //          not a stale cache line.
+  //   write: copy in, then write-back so the DMA reads what the CPU wrote.
+  //
+  if (Read) {
+    InvalidateDataCacheRange (mAdmaBuffer, Length);
+  } else {
+    CopyMem (mAdmaBuffer, Buffer, Length);
+    WriteBackDataCacheRange (mAdmaBuffer, Length);
+  }
 
   AdmaBuild ((UINT64)(UINTN)mAdmaBuffer, Length, TRUE);
+
+  //
+  // The descriptor table itself is also read by the DMA engine, so its cache
+  // lines must be written back before the transfer starts.
+  //
+  WriteBackDataCacheRange (mAdmaTable, sizeof (ADMA2_DESC64));
 
   SdWrite32 (SDHCI_ADMA_ADDRESS, (UINT32)((UINTN)mAdmaTable & 0xFFFFFFFFu));
   if ((SdRead32 (SDHCI_CAPABILITIES) & SDHCI_CAP_64BIT) != 0) {
@@ -733,6 +756,12 @@ SdTransfer (
   SdClearStatus ();
 
   if (Read) {
+    //
+    // The DMA has written fresh card data into the bounce buffer; invalidate
+    // again so the copy-out reads physical memory, not the stale lines that
+    // were there before the transfer.
+    //
+    InvalidateDataCacheRange (mAdmaBuffer, Length);
     CopyMem (Buffer, mAdmaBuffer, Length);
   }
 
@@ -831,7 +860,14 @@ SdDecodeCsd (
 {
   UINT32  Structure;
 
-  Structure = (Csd[3] >> 30) & 0x3;
+  //
+  // The CSD arrives as a 128-bit R2 response.  SDHCI stores it big-endian:
+  // Csd[0] holds CSD[127:96], Csd[1] holds CSD[95:64], Csd[2] holds
+  // CSD[63:32], Csd[3] holds CSD[31:0].  Every field below is read with that
+  // layout (the bit numbers in the SD spec are MSB-first), which is the exact
+  // opposite of what a naive "low word = low bits" reading would produce.
+  //
+  Structure = (Csd[0] >> 30) & 0x3;   // CSD_STRUCTURE [127:126]
 
   if (Structure == 0) {
     //
@@ -839,9 +875,9 @@ SdDecodeCsd (
     // Not expected on a 64 GB card, but a card that answers this way is still
     // a card and the arithmetic is three lines.
     //
-    UINT32  CSize     = ((Csd[2] & 0x3FFu) << 2) | (Csd[1] >> 30);
-    UINT32  CSizeMult = (Csd[1] >> 15) & 0x7;
-    UINT32  ReadBlLen = (Csd[2] >> 16) & 0xF;
+    UINT32  CSize     = ((Csd[1] & 0x3FFu) << 2) | (Csd[2] >> 30);   // [73:62]
+    UINT32  CSizeMult = (Csd[2] >> 15) & 0x7;                          // [49:47]
+    UINT32  ReadBlLen = (Csd[1] >> 16) & 0xF;                          // [83:80]
 
     mSd.HighCapacity = FALSE;
     mSd.Capacity     = ((UINT64)(CSize + 1))
@@ -850,8 +886,10 @@ SdDecodeCsd (
   } else if (Structure == 1) {
     //
     // CSD 2.0: SDHC/SDXC.  C_SIZE[69:48], capacity = (C_SIZE+1) * 512 KB.
+    // C_SIZE high 6 bits [69:64] live in Csd[1][5:0]; the low 16 bits
+    // [63:48] live in Csd[2][31:16].
     //
-    UINT32  CSize = ((Csd[2] & 0x3Fu) << 16) | ((Csd[1] >> 16) & 0xFFFFu);
+    UINT32  CSize = ((Csd[1] & 0x3Fu) << 16) | ((Csd[2] >> 16) & 0xFFFFu);
 
     mSd.HighCapacity = TRUE;
     mSd.Capacity     = ((UINT64)(CSize + 1)) * 512ULL * 1024ULL;
@@ -1241,26 +1279,18 @@ SdInitDevicePath (
 {
   ZeroMem (&mSdDevicePath, sizeof (mSdDevicePath));
 
-  mSdDevicePath.Vendor.Header.Type    = HARDWARE_DEVICE_PATH;
-  mSdDevicePath.Vendor.Header.SubType = HW_VENDOR_DP;
-  mSdDevicePath.Vendor.Header.Length[0] = (UINT8)(sizeof (VENDOR_DEVICE_PATH) & 0xFF);
-  mSdDevicePath.Vendor.Header.Length[1] = (UINT8)(sizeof (VENDOR_DEVICE_PATH) >> 8);
-
   //
-  // "clover-sd" as a GUID stand-in; the value only has to be stable within
-  // this firmware image.
+  // Use the standard SD device path node (Messaging / SD_DP), not a vendor
+  // node.  SimpleInit and ConvertDevicePathToText know how to render this one,
+  // and a vendor node with a made-up GUID is exactly the kind of input that
+  // makes a device-path walker compute a wrong string and then abort in a
+  // string routine.
   //
-  mSdDevicePath.Vendor.Guid.Data1 = 0x0C10E5D0;
-  mSdDevicePath.Vendor.Guid.Data2 = 0x5D01;
-  mSdDevicePath.Vendor.Guid.Data3 = 0x4C4C;
-  mSdDevicePath.Vendor.Guid.Data4[0] = 0x9A;
-  mSdDevicePath.Vendor.Guid.Data4[1] = 0x11;
-  mSdDevicePath.Vendor.Guid.Data4[2] = 0xDE;
-  mSdDevicePath.Vendor.Guid.Data4[3] = 0xAD;
-  mSdDevicePath.Vendor.Guid.Data4[4] = 0xBE;
-  mSdDevicePath.Vendor.Guid.Data4[5] = 0xEF;
-  mSdDevicePath.Vendor.Guid.Data4[6] = 0x00;
-  mSdDevicePath.Vendor.Guid.Data4[7] = 0x01;
+  mSdDevicePath.Sd.Header.Type    = MESSAGING_DEVICE_PATH;
+  mSdDevicePath.Sd.Header.SubType = MSG_SD_DP;
+  mSdDevicePath.Sd.Header.Length[0] = (UINT8)(sizeof (SD_DEVICE_PATH) & 0xFF);
+  mSdDevicePath.Sd.Header.Length[1] = (UINT8)(sizeof (SD_DEVICE_PATH) >> 8);
+  mSdDevicePath.Sd.SlotNumber       = 0;
 
   mSdDevicePath.End.Type    = END_DEVICE_PATH_TYPE;
   mSdDevicePath.End.SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
@@ -1295,24 +1325,25 @@ CloverSdDxeEntry (
   DEBUG ((DEBUG_INFO, "\nCloverSd: probing sdhci@c084000\n"));
 
   //
-  // 1. Clocks.  Both branches are enabled before anything is read from the
-  //    host window; a gated SDCC returns zeros and would be misread as absent.
+  // 1. Enable the SDCC2 clocks FIRST.  This driver runs after ClockDxe (its
+  //    Depex is gEfiClockProtocolGuid), but ClockDxe only brings up the clocks
+  //    the boot path uses -- eMMC's SDCC1 -- and leaves SDCC2 gated.  Reading
+  //    a gated controller is not a harmless zero: the AHB decode returns a
+  //    Synchronous external abort (FAR 0xC0840FE was the HOST_VERSION read),
+  //    which is exactly the crash this fixes.  So the AHB branch must be on
+  //    before the first load from the host window, with no probe first.
   //
-  Status = GccEnableBranch (GCC_SDCC2_AHB_CBCR);
-  if (EFI_ERROR (Status)) {
-    return EFI_NOT_FOUND;
-  }
-  Status = GccEnableBranch (GCC_SDCC2_APPS_CBCR);
-  if (EFI_ERROR (Status)) {
-    return EFI_NOT_FOUND;
-  }
-
+  //    The GCC block itself (0x100000) is always powered and mapped, so these
+  //    writes are safe; they only touch SDCC2's two branch registers.
   //
-  // 2. Identification clock, before the first host access.
-  //
+  GccEnableBranch (GCC_SDCC2_AHB_CBCR);
+  GccEnableBranch (GCC_SDCC2_APPS_CBCR);
   GccSetRate (GCC_CFG_400K, GCC_M_400K, GCC_N_400K, GCC_D_400K);
   gBS->Stall (1000);
 
+  //
+  // 2. Now the first host access is safe.
+  //
   Version = SdRead16 (SDHCI_HOST_VERSION);
   DEBUG ((DEBUG_INFO, "CloverSd: host version 0x%04x\n", Version));
 
@@ -1447,6 +1478,7 @@ CloverSdDxeEntry (
     mAdmaBuffer = NULL;
     mAdmaTable  = NULL;
     DEBUG ((DEBUG_INFO, "CloverSd: no usable card (%r), nothing published\n", Status));
+    Print (L"\n[CloverSd] no card / init failed (%r)\n", Status);
     return Status;
   }
 
@@ -1455,6 +1487,63 @@ CloverSdDxeEntry (
   //    because SdRaiseClock puts the identification clock back itself.
   //
   SdRaiseClock ();
+
+  //
+  // 9. Read LBA 0 once to prove the data path.  A card whose first sector does
+  //    not look like a partition table (GPT "EFI PART" magic, or an MBR
+  //    0x55AA at offset 510) is either unreadable through ADMA or genuinely
+  //    blank.  Either way, publishing a BlockIo that returns garbage is what
+  //    made SimpleInit walk a bad pointer and abort -- so a failed self-test
+  //    must NOT publish.  Report with DEBUG_ERROR, which RELEASE keeps and
+  //    FrameBufferSerialPortLib paints, so the verdict is visible on screen.
+  //
+  {
+    UINT8        Probe[SD_BLOCK_SIZE];
+    BOOLEAN      LooksPartitioned;
+    EFI_STATUS   ProbeStatus;
+
+    ZeroMem (Probe, sizeof (Probe));
+    ProbeStatus = SdTransfer (0, 1, Probe, TRUE);
+
+    LooksPartitioned = FALSE;
+    if (!EFI_ERROR (ProbeStatus)) {
+      //
+      // GPT magic is the ASCII "EFI PART" at byte 0.
+      //
+      if ((Probe[0] == 'E') && (Probe[1] == 'F') && (Probe[2] == 'I') &&
+          (Probe[3] == ' ') && (Probe[4] == 'P') && (Probe[5] == 'A') &&
+          (Probe[6] == 'R') && (Probe[7] == 'T'))
+      {
+        LooksPartitioned = TRUE;
+      }
+
+      //
+      // MBR boot signature is 0x55 0xAA at bytes 510..511.
+      //
+      if ((Probe[510] == 0x55) && (Probe[511] == 0xAA)) {
+        LooksPartitioned = TRUE;
+      }
+    }
+
+    if (!LooksPartitioned) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "CloverSd: LBA0 self-test failed (status %r), first bytes "
+        "%02x %02x %02x %02x %02x %02x %02x %02x -- NOT publishing BlockIo\n",
+        ProbeStatus,
+        Probe[0], Probe[1], Probe[2], Probe[3],
+        Probe[4], Probe[5], Probe[6], Probe[7]
+        ));
+
+      FreePages (mAdmaBuffer, mAdmaBufferPages);
+      FreePages (mAdmaTable, EFI_SIZE_TO_PAGES (sizeof (ADMA2_DESC64)));
+      mAdmaBuffer = NULL;
+      mAdmaTable  = NULL;
+      return EFI_DEVICE_ERROR;
+    }
+
+    DEBUG ((DEBUG_ERROR, "CloverSd: LBA0 self-test OK (GPT or MBR magic present)\n"));
+  }
 
   ZeroMem (&mSdMedia, sizeof (mSdMedia));
   mSdMedia.MediaId     = 0x5D0C10E5;
@@ -1498,6 +1587,17 @@ CloverSdDxeEntry (
     mSd.BusWidth4 ? 4 : 1,
     mSd.ClockKhz
     ));
+
+  //
+  // Print the verdict through the standard text console too.  ConOut goes to
+  // the framebuffer once SimpleFbDxe installs, so this line is readable on the
+  // panel; DEBUG_ERROR above goes to the same place via the serial port lib.
+  //
+  Print (L"\n[CloverSd] SD card OK: %ld MB, %d blocks, RCA 0x%04x, %d-bit\n",
+         (UINT64)(mSd.Capacity / (1024 * 1024)),
+         mSd.LastBlock + 1,
+         mSd.Rca,
+         mSd.BusWidth4 ? 4 : 1);
 
   return EFI_SUCCESS;
 }
