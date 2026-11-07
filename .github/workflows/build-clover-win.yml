@@ -17,12 +17,15 @@ jobs:
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             https://gh-proxy.com/https://github.com/edk2-porting/edk2-msm.git edk2-msm 2>&1 | tail -20
 
-      - name: Apply CloverGopDxe patch
+      - name: Apply CloverGopDxe + CloverSdDxe patches
         run: |
           bash patch-gop.sh "$GITHUB_WORKSPACE/edk2-msm" "$GITHUB_WORKSPACE"
-          echo "=== verify patch ==="
+          bash patch-sd.sh  "$GITHUB_WORKSPACE/edk2-msm" "$GITHUB_WORKSPACE"
+          echo "=== verify patches ==="
           grep -n "CloverGopDxe" edk2-msm/Platform/Qualcomm/sdm660/sdm660.dsc
+          grep -n "CloverSdDxe"  edk2-msm/Platform/Qualcomm/sdm660/sdm660.dsc
           grep -n "CloverGopDxe" edk2-msm/Platform/Qualcomm/sdm660/dxe.fdf.inc
+          grep -n "CloverSdDxe"  edk2-msm/Platform/Qualcomm/sdm660/dxe.fdf.inc
 
       - name: Install build deps
         run: |

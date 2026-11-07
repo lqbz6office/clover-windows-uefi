@@ -1,0 +1,41 @@
+## @file
+# clover (Xiaomi Mi Pad 4, SDM660): BlockIo over sdhci@c084000.
+#
+# The rest of the storage chain (DiskIoDxe, PartitionDxe, Fat) is already in
+# sdm660.fdf; this module is the missing BlockIo producer for the SD slot.
+#
+# Copyright (c) 2026, clover-windows-uefi contributors.
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = CloverSdDxe
+  FILE_GUID                      = 7C3A1E52-9B44-4D0E-8E31-5A2C6F1D9B47
+  MODULE_TYPE                    = UEFI_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = CloverSdDxeEntry
+
+[Sources]
+  CloverSdDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+  MemoryAllocationLib
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  IoLib
+
+[Protocols]
+  gEfiBlockIoProtocolGuid
+  gEfiDevicePathProtocolGuid
+
+[Depex]
+  TRUE
